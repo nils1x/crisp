@@ -2,10 +2,13 @@ import ApplicationServices
 import CoreGraphics
 import Foundation
 
+// SPDX-License-Identifier: MPL-2.0
+//
 // Undocumented DockSwipe protocol adapted from Tahul/space-rabbit (MPL-2.0),
 // App/SpaceSwitching.swift at commit 54d6eb4; packed fields cross-checked
 // against mgbowen/FasterSwiper (Apache-2.0), src/gesture-serialization.cc.
-// No private framework or SIP change. Dock acceptance still needs physical testing.
+// This file is MPL-2.0, not MIT like the rest of Crisp. No private framework
+// or SIP change. Dock acceptance still needs physical testing.
 enum SpaceGesture {
     enum Direction { case previous, next }
     enum Phase: Int64, CaseIterable { case began = 1, changed = 2, ended = 4 }
