@@ -44,6 +44,11 @@ final class HyperRemap {
     private var active = false
     var onKeyboardChange: (() -> Void)?
 
+    private static let keyboardChange: IOHIDDeviceCallback = { context, _, _, _ in
+        guard let context else { return }
+        Unmanaged<HyperRemap>.fromOpaque(context).takeUnretainedValue().onKeyboardChange?()
+    }
+
     func enable() -> String? {
         if active { return nil }
         guard owned.isEmpty else {
@@ -60,32 +65,37 @@ final class HyperRemap {
 
     // Mapping is per keyboard service, not global. Bluetooth keyboards can arrive
     // after launch (or get a new service on reconnection).
-    func refresh() -> String? {
-        guard active else { return nil }
+    //
+    // `changed` reports whether this pass wrote anything. Callers use it to back off
+    // the safety-net poll: a pass that only re-read already-correct mappings proves
+    // nothing about the next one.
+    func refresh() -> (failure: String?, changed: Bool) {
+        guard active else { return (nil, false) }
         // A retained event-system client can miss a new Bluetooth keyboard service.
         // Create a fresh snapshot on every refresh, including the periodic fallback.
         let system = IOHIDEventSystemClientCreateSimpleClient(kCFAllocatorDefault)
         guard let services = IOHIDEventSystemClientCopyServices(system) as? [IOHIDServiceClient] else {
-            return "Could not inspect connected keyboards."
+            return ("Could not inspect connected keyboards.", true)
         }
         let keyboards = services.filter { IOHIDServiceClientConformsTo($0, 1, 6) != 0 }
-        guard !keyboards.isEmpty else { return "No keyboard service found; Caps Lock was not changed." }
+        guard !keyboards.isEmpty else { return ("No keyboard service found; Caps Lock was not changed.", true) }
         let entry: [String: NSNumber] = [sourceKey: NSNumber(value: source),
                                           destinationKey: NSNumber(value: destination)]
         // Read and inspect every service before writing any newly discovered one.
-        // Keep each registry ID from this pass; the eight-second watchdog must not
+        // Keep each registry ID from this pass; the watchdog must not
         // query the same service IDs once to prune ownership and again to map.
         var snapshots: [(service: IOHIDServiceClient, id: UInt64, mappings: [[String: NSNumber]])] = []
         for service in keyboards {
             guard let id = serviceID(service), let current = mappings(for: service) else {
-                return "Could not read a keyboard mapping."
+                return ("Could not read a keyboard mapping.", true)
             }
             if Self.mappingState(in: current) == .conflict {
-                return "Caps Lock is already mapped to a different key. Disable that remap or choose another Hyper source."
+                return ("Caps Lock is already mapped to a different key. Disable that remap or choose another Hyper source.", true)
             }
             snapshots.append((service, id, current))
         }
         owned.formIntersection(Set(snapshots.map(\.id)))
+        var changed = false
         for (service, id, current) in snapshots {
             switch Self.mappingState(in: current) {
             case .desired:
@@ -93,21 +103,22 @@ final class HyperRemap {
                 // not claim or remove a mapping that this Crisp session did not create.
                 continue
             case .conflict:
-                return "Caps Lock is already mapped to a different key. Disable that remap or choose another Hyper source."
+                return ("Caps Lock is already mapped to a different key. Disable that remap or choose another Hyper source.", true)
             case .missing:
                 break
             }
             // If the mapping vanished while connected, reclaim it on the live service.
             owned.remove(id)
             guard IOHIDServiceClientSetProperty(service, key, (current + [entry]) as CFArray) else {
-                return "Couldn't remap a connected keyboard's Caps Lock."
+                return ("Couldn't remap a connected keyboard's Caps Lock.", true)
             }
+            changed = true
             owned.insert(id) // Retain ownership for normal Quit, even if verification fails.
             guard let applied = mappings(for: service), applied.contains(where: {
                 $0[sourceKey]?.uint64Value == source && $0[destinationKey]?.uint64Value == destination
-            }) else { return "Caps Lock remap was not confirmed on a connected keyboard." }
+            }) else { return ("Caps Lock remap was not confirmed on a connected keyboard.", true) }
         }
-        return nil
+        return (nil, changed)
     }
 
     // Only correct a *reported raw Caps Lock event*. Never change the user's
@@ -134,10 +145,11 @@ final class HyperRemap {
         let monitor = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
         IOHIDManagerSetDeviceMatching(monitor, [kIOHIDDeviceUsagePageKey: 1,
                                                 kIOHIDDeviceUsageKey: 6] as CFDictionary)
-        IOHIDManagerRegisterDeviceMatchingCallback(monitor, { context, _, _, _ in
-            guard let context else { return }
-            Unmanaged<HyperRemap>.fromOpaque(context).takeUnretainedValue().onKeyboardChange?()
-        }, Unmanaged.passUnretained(self).toOpaque())
+        // Both directions: a matching callback covers a keyboard arriving, a removal
+        // callback covers one leaving. Either can replace a keyboard's service, so the
+        // push path reacts immediately and the periodic poll is only a safety net.
+        IOHIDManagerRegisterDeviceMatchingCallback(monitor, HyperRemap.keyboardChange, Unmanaged.passUnretained(self).toOpaque())
+        IOHIDManagerRegisterDeviceRemovalCallback(monitor, HyperRemap.keyboardChange, Unmanaged.passUnretained(self).toOpaque())
         IOHIDManagerScheduleWithRunLoop(monitor, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
         if IOHIDManagerOpen(monitor, IOOptionBits(kIOHIDOptionsTypeNone)) == kIOReturnSuccess {
             manager = monitor

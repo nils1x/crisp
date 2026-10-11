@@ -28,6 +28,11 @@ final class CrispController: ObservableObject {
     private var hyperModifiedKeys: Set<Int> = []
     private var retryTimer: Timer?
     private var keyboardRetryTimer: Timer?
+    /// Both timers are safety nets for state that already has a push channel: the tap
+    /// callback reports a disabled tap, the HID manager reports keyboard changes. Each
+    /// backs off when a pass finds nothing, so an idle Crisp stops waking up.
+    private var tapSchedule = PollSchedule(base: 4, cap: 300)
+    private var keyboardSchedule = PollSchedule(base: 8, cap: 300)
     private var pendingSave: DispatchWorkItem?
     private var recordAction: ((Shortcut) -> Void)?
     private var recordMouseMonitor: Any?
@@ -59,14 +64,12 @@ final class CrispController: ObservableObject {
         remap.onKeyboardChange = { [weak self] in
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.hyperActive, self.config.hyperSource == .capsLock else { return }
-                if let failure = self.remap.refresh() { self.error = failure }
+                self.keyboardSchedule.reset()
+                if let failure = self.remap.refresh().failure { self.error = failure }
             }
         }
-        checkTap()
-        guard retryTimer == nil else { return }
-        retryTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.checkTap() }
-        }
+        tapSchedule.reset()
+        runTapCheck()
     }
 
     func requestPermission() {
@@ -82,6 +85,8 @@ final class CrispController: ObservableObject {
         retryTimer = nil
         keyboardRetryTimer?.invalidate()
         keyboardRetryTimer = nil
+        tapSchedule.reset()
+        keyboardSchedule.reset()
         if let pendingSave {
             pendingSave.cancel()
             self.pendingSave = nil
@@ -195,7 +200,16 @@ final class CrispController: ObservableObject {
         else { error = "Keyboard monitoring is unavailable. Check Accessibility and Input Monitoring." }
     }
 
-    private func checkTap() {
+    /// Re-arms a tap macOS disabled, then reschedules the safety poll. A healthy tap only
+    /// needs the slow net: `crispEventCallback` already reports `.tapDisabledByTimeout`
+    /// and `.tapDisabledByUserInput` immediately.
+    private func runTapCheck() {
+        if checkTap() { tapSchedule.backOff() } else { tapSchedule.reset() }
+        schedule(tapSchedule.interval, &retryTimer) { $0.runTapCheck() }
+    }
+
+    /// Returns whether the tap exists and is enabled once the pass finishes.
+    private func checkTap() -> Bool {
         if tap == nil { installTap() }
         else if let tap, !CGEvent.tapIsEnabled(tap: tap) {
             CGEvent.tapEnable(tap: tap, enable: true)
@@ -209,6 +223,19 @@ final class CrispController: ObservableObject {
                 remap.disable()
                 stopKeyboardWatchdog()
             }
+        }
+        guard let tap else { return false }
+        return CGEvent.tapIsEnabled(tap: tap)
+    }
+
+    /// NSTimer cannot change its interval, so each pass replaces the timer. `work`
+    /// runs on the main actor; the timer holds the controller weakly.
+    private func schedule(_ interval: TimeInterval, _ timer: inout Timer?,
+                         _ work: @escaping @MainActor (CrispController) -> Void) {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            MainActor.assumeIsolated { work(self) }
         }
     }
 
@@ -234,20 +261,27 @@ final class CrispController: ObservableObject {
     }
 
     private func startKeyboardWatchdog() {
-        guard keyboardRetryTimer == nil else { return }
-        // Device-match callbacks handle normal connects immediately. This slower
-        // fallback catches Bluetooth replacements that macOS reports silently.
-        keyboardRetryTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated {
-                guard let self, self.hyperActive, self.config.hyperSource == .capsLock else { return }
-                if let failure = self.remap.refresh() { self.error = failure }
-            }
-        }
+        keyboardSchedule.reset()
+        runKeyboardWatchdog()
     }
 
     private func stopKeyboardWatchdog() {
         keyboardRetryTimer?.invalidate()
         keyboardRetryTimer = nil
+    }
+
+    /// Device-match callbacks handle normal connects immediately. This slower fallback
+    /// catches Bluetooth replacements that macOS reports silently, so it only earns a
+    /// fast interval while a pass actually wrote a mapping or reported a failure.
+    private func runKeyboardWatchdog() {
+        guard hyperActive, config.hyperSource == .capsLock else {
+            stopKeyboardWatchdog()
+            return
+        }
+        let (failure, changed) = remap.refresh()
+        if let failure { error = failure }
+        if failure != nil || changed { keyboardSchedule.reset() } else { keyboardSchedule.backOff() }
+        schedule(keyboardSchedule.interval, &keyboardRetryTimer) { $0.runKeyboardWatchdog() }
     }
 
     fileprivate func handle(_ event: CGEvent, type: CGEventType) -> Unmanaged<CGEvent>? {
@@ -264,7 +298,8 @@ final class CrispController: ObservableObject {
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.hyperActive, self.config.hyperSource == .capsLock else { return }
                     if becameLocked { self.remap.clearCapsLockState() }
-                    if let failure = self.remap.refresh() { self.error = failure }
+                    self.keyboardSchedule.reset()
+                    if let failure = self.remap.refresh().failure { self.error = failure }
                 }
                 return nil
             }

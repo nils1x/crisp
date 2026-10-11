@@ -533,4 +533,31 @@ final class ModelTests: XCTestCase {
         XCTAssertEqual(SpaceGesture.fixed(.nan), 0)
         XCTAssertEqual(SpaceGesture.fixed(.infinity), 0)
     }
+
+    func testPollScheduleStartsAtBaseAndDoublesToCap() {
+        var schedule = PollSchedule(base: 8, cap: 300)
+        XCTAssertEqual(schedule.interval, 8)
+        schedule.backOff()
+        XCTAssertEqual(schedule.interval, 16)
+        schedule.backOff()
+        XCTAssertEqual(schedule.interval, 32)
+        // 8 → 16 → 32 → 64 → 128 → 256 → 512 overshoots the cap, so it clamps.
+        for _ in 0..<10 { schedule.backOff() }
+        XCTAssertEqual(schedule.interval, 300)
+    }
+
+    func testPollScheduleResetReturnsToBaseAfterChange() {
+        var schedule = PollSchedule(base: 8, cap: 300)
+        for _ in 0..<5 { schedule.backOff() }
+        XCTAssertEqual(schedule.interval, 256)
+        // The sixth doubling would reach 512, so it clamps to the cap instead.
+        schedule.backOff()
+        XCTAssertEqual(schedule.interval, 300)
+        schedule.reset()
+        XCTAssertEqual(schedule.interval, 8)
+        // Reset also clears a schedule already sitting at the cap.
+        for _ in 0..<10 { schedule.backOff() }
+        schedule.reset()
+        XCTAssertEqual(schedule.interval, 8)
+    }
 }
