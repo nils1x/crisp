@@ -454,6 +454,32 @@ struct ShortcutResolver {
     }
 }
 
+/// Backoff for a safety-net poll whose real triggers are push based. Each quiet pass
+/// doubles the wait, up to `cap`; anything interesting calls `reset()` so the next pass
+/// runs at `base` again. Keeps a watchdog from waking the process on a fixed cadence
+/// when nothing can have changed.
+struct PollSchedule: Equatable {
+    let base: TimeInterval
+    let cap: TimeInterval
+    private(set) var interval: TimeInterval
+
+    init(base: TimeInterval, cap: TimeInterval) {
+        self.base = base
+        self.cap = cap
+        self.interval = base
+    }
+
+    /// A pass that found nothing new.
+    mutating func backOff() {
+        interval = min(interval * 2, cap)
+    }
+
+    /// Something changed, or the poll just started: check again next tick.
+    mutating func reset() {
+        interval = base
+    }
+}
+
 struct LayoutCycle {
     private var lastShortcut: Shortcut?
     private var lastLayoutID: UUID?

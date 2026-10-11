@@ -50,7 +50,7 @@ final class HyperRemap {
             return "A previous Caps Lock mapping could not be removed. Check it before retrying."
         }
         active = true
-        if let failure = refresh() {
+        if let failure = refresh().failure {
             disable()
             return failure
         }
